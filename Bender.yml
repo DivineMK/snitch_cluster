@@ -111,6 +111,8 @@ sources:
       - hw/tcdm_interface/src/axi_to_tcdm.sv
       - hw/tcdm_interface/src/lsu_to_tcdm.sv
       - hw/tcdm_interface/src/tcdm_mux.sv
+      - hw/tcdm_interface/src/tcdm_narrow_join.sv
+      - hw/tcdm_interface/src/tcdm_to_axi.sv
   - target: test
     files:
       - hw/tcdm_interface/src/tcdm_test.sv
