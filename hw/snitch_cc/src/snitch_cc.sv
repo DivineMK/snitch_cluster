@@ -113,13 +113,10 @@ module snitch_cc
   parameter int unsigned CollectiveWidth    = 1,
   /// Enable direct compute access (DCA).
   parameter bit          EnableDca          = 0,
-  /// Enable Spatz vector-to-AXI joiner (v1, review only, default off).
+  /// Enable Spatz vector-to-AXI joiner (v0.1)
   /// When 0, Spatz VLSU ports go straight to TCDM (current behavior).
-  /// When 1, each VLSU port is decoded by the TCDM base/mask rule: TCDM-bound
-  /// ports keep the existing TCDM path, AXI-bound contiguous groups are joined
-  /// to one 64B beat. DMA is disabled in this mode (`Xdma` + `EnableSpatzAxi`
-  /// is illegal) and the joiner drives the DMA AXI ports directly.
-  /// Depth-1 groups while enabled (see below).
+  /// When 1, each VLSU port is routed by address, either to TCDM ports or AXI contiguous access are joined
+  /// to one 64B beat. DMA is disabled in this mode (`Xdma` + `EnableSpatzAxi` is illegal)
   parameter bit          EnableSpatzAxi     = 1'b1,
   /// Derived parameter *Do not override*
   localparam int unsigned NumTcdmPorts = snitch_cc_pkg::get_tcdm_ports(
@@ -351,6 +348,17 @@ module snitch_cc
   // group (0: TCDM, 1: AXI) plus per-port response-pending bits.
   logic spatz_path_q;
   logic [NumSpatzMemPorts-1:0] spatz_pend_q;
+  // Memory fence support to sync between Spatz and Snitch
+  logic [1:0] spatz_mem_finished;
+  logic [1:0] spatz_mem_str_finished;
+  // snitch and spatz may be in different clock domain (IsoCrossing), raw is
+  // sampled by spatz
+  logic spatz_busy_raw_d, spatz_busy_raw_q;
+  // Counter for outstanding VLSU ops
+  logic [2:0] spatz_vlsu_cnt_q, spatz_vlsu_cnt_d;
+  logic       spatz_busy_synced;
+  logic       spatz_issue_d2_q;
+  logic       spatz_busy_d2;
   // AXI-side joiner request/response (drives the DMA AXI ports when enabled).
   axi_req_t spatz_join_req;
   axi_rsp_t spatz_join_res;
@@ -443,6 +451,7 @@ module snitch_cc
     .core_events_o     (snitch_events),
     .barrier_o         (barrier_o),
     .barrier_i         (barrier_i),
+    .spatz_busy_i      (spatz_busy_d2),
     .en_copift_o       (en_copift)
   );
 
@@ -849,8 +858,8 @@ module snitch_cc
       .spatz_mem_req_ready_i   (spatz_full_req_ready),
       .spatz_mem_rsp_i         (spatz_full_rsp_chan),
       .spatz_mem_rsp_valid_i   (spatz_full_rsp_valid),
-      .spatz_mem_finished_o    (/*TODO: wire to fence instruction*/),
-      .spatz_mem_str_finished_o(),
+      .spatz_mem_finished_o    (spatz_mem_finished),
+      .spatz_mem_str_finished_o(spatz_mem_str_finished),
       .fp_lsu_mem_req_o        (spatz_flsu_req),
       .fp_lsu_mem_rsp_i        (spatz_flsu_rsp),
       .fpu_rnd_mode_i          (spatz_fpu_rnd_mode),
@@ -897,10 +906,10 @@ module snitch_cc
       assign spatz_group_tcdm = 1'b0;
       assign spatz_group_axi  = 1'b0;
       assign spatz_path_q     = 1'b0;
-      assign spatz_pend_q     = '0;
       assign spatz_join_req   = '0;
       assign spatz_join_res   = '0;
-    end else begin : gen_spatz_steer_axi
+      assign spatz_busy_raw_q = 1'b0;
+    end else begin : gen_spatz_axi
       // TCDM address rule, same base/mask form as the LSU demux above.
       // Assumption: every VLSU port either accesses all AXI or all TCDM.
       // Destination is decoded from the first presenting (valid) lane.
@@ -931,6 +940,27 @@ module snitch_cc
       logic any_idle;
       assign any_valid        = |spatz_full_req_valid;
       assign any_idle         = (spatz_pend_q == '0);
+      // Currently any_idle (from spatz_pend) serialize all requests, forcing effective NumOutstandingLoads=1.
+      // To overcome this later on (with pipelining), we will need to replace these with per-port counter
+
+      logic [NumSpatzMemPorts-1:0] spatz_pend_d; // pending requests
+      logic spatz_path_d;
+      logic any_accept;
+      assign any_accept = |(spatz_full_req_valid & spatz_full_req_ready);
+      always_comb begin
+        spatz_pend_d = spatz_pend_q;
+        spatz_path_d = spatz_path_q;
+
+        if (any_accept) spatz_path_d = !spatz_is_tcdm;
+        for (int p = 0; p < NumSpatzMemPorts; p++) begin
+          if (spatz_full_req_valid[p] && spatz_full_req_ready[p]) begin
+            spatz_pend_d[p] = 1'b1;
+          end
+          if (spatz_full_rsp_valid[p]) spatz_pend_d[p] = 1'b0;
+        end
+      end
+      `FF(spatz_pend_q, spatz_pend_d, '0, clk_i, rst_ni)
+      `FF(spatz_path_q, spatz_path_d, '0, clk_i, rst_ni)
       assign spatz_group_tcdm = any_valid &&  spatz_is_tcdm && any_idle;
       assign spatz_group_axi  = any_valid && !spatz_is_tcdm && any_idle;
 
@@ -985,15 +1015,8 @@ module snitch_cc
         .axi_rsp_i  (spatz_join_res)
       );
 
-      // DMA is disabled in this mode: the joiner owns DMA AXI channel 0
-      // directly, other channels stay tied off (see `gen_no_dma` above).
-      for (genvar c = 0; c < DMANumChannels; c++) begin : gen_spatz_dma_drv
-        if (c == 0) begin : gen_ch0
-          assign axi_dma_req_o[c] = spatz_join_req;
-        end else begin : gen_chN
-          assign axi_dma_req_o[c] = '0;
-        end
-      end
+      // reuse iDMA wires
+      assign axi_dma_req_o[0] = spatz_join_req;
       assign spatz_join_res = axi_dma_res_i[0];
 
       // Steer requests to TCDM or AXI based on the address map
@@ -1020,28 +1043,43 @@ module snitch_cc
         )
       end
 
-      logic [NumSpatzMemPorts-1:0] spatz_pend_d;
-      logic spatz_path_d;
-      logic any_accept;
-      assign any_accept = |(spatz_full_req_valid & spatz_full_req_ready);
+      // restrict FENCE to only work with VLSU ops because its sole purpose is
+      // replacing snrt_dma_wait_all()
+      logic vlsu_mem_accept;
+      assign vlsu_mem_accept = cop_issue_valid[SpatzCopro] & cop_issue_ready[SpatzCopro]
+          && (cop_issue_req[SpatzCopro].instr inside
+        {spatz_riscv_instr::VLE8_V, spatz_riscv_instr::VLE16_V,
+        spatz_riscv_instr::VLE32_V, spatz_riscv_instr::VLE64_V,
+        spatz_riscv_instr::VLSE8_V, spatz_riscv_instr::VLSE16_V,
+        spatz_riscv_instr::VLSE32_V, spatz_riscv_instr::VLSE64_V,
+        spatz_riscv_instr::VLOXEI8_V, spatz_riscv_instr::VLOXEI16_V,
+        spatz_riscv_instr::VLOXEI32_V, spatz_riscv_instr::VLOXEI64_V,
+        spatz_riscv_instr::VLUXEI8_V, spatz_riscv_instr::VLUXEI16_V,
+        spatz_riscv_instr::VLUXEI32_V, spatz_riscv_instr::VLUXEI64_V,
+        spatz_riscv_instr::VSE8_V, spatz_riscv_instr::VSE16_V,
+        spatz_riscv_instr::VSE32_V, spatz_riscv_instr::VSE64_V,
+        spatz_riscv_instr::VSSE8_V, spatz_riscv_instr::VSSE16_V,
+        spatz_riscv_instr::VSSE32_V, spatz_riscv_instr::VSSE64_V,
+        spatz_riscv_instr::VSOXEI8_V, spatz_riscv_instr::VSOXEI16_V,
+        spatz_riscv_instr::VSOXEI32_V, spatz_riscv_instr::VSOXEI64_V,
+        spatz_riscv_instr::VSUXEI8_V, spatz_riscv_instr::VSUXEI16_V,
+        spatz_riscv_instr::VSUXEI32_V, spatz_riscv_instr::VSUXEI64_V});
 
       always_comb begin
-        spatz_pend_d = spatz_pend_q;
-        spatz_path_d = spatz_path_q;
-
-        if (any_accept) spatz_path_d = !spatz_is_tcdm;
-        for (int p = 0; p < NumSpatzMemPorts; p++) begin
-          // Accept onto either path.
-          if (spatz_full_req_valid[p] && spatz_full_req_ready[p]) begin
-            spatz_pend_d[p] = 1'b1;
-          end
-          // Response consumed (TCDM `p` has no backpressure).
-          if (spatz_full_rsp_valid[p]) spatz_pend_d[p] = 1'b0;
-        end
+        spatz_vlsu_cnt_d = spatz_vlsu_cnt_q;
+        if (vlsu_mem_accept && !spatz_mem_finished[1] && spatz_vlsu_cnt_q != '1)
+          spatz_vlsu_cnt_d = spatz_vlsu_cnt_q + 1'b1;
+        else if (!vlsu_mem_accept && spatz_mem_finished[1] && spatz_vlsu_cnt_q != '0)
+          spatz_vlsu_cnt_d = spatz_vlsu_cnt_q - 1'b1;
       end
-      `FF(spatz_pend_q, spatz_pend_d, '0, clk_i, rst_ni)
-      `FF(spatz_path_q, spatz_path_d, '0, clk_i, rst_ni)
-    end
+      `FF(spatz_vlsu_cnt_q, spatz_vlsu_cnt_d, '0, clk_i, rst_ni)
+
+      // Busy = counted-but-uncommitted vector ops + live request/pending
+      // traffic (store-response tail W2, past finish).
+      assign spatz_busy_raw_d = (spatz_vlsu_cnt_q != '0)
+          || (|spatz_full_req_valid) || (|spatz_pend_q);
+      `FF(spatz_busy_raw_q, spatz_busy_raw_d, '0, clk_i, rst_ni)
+    end : gen_spatz_axi
   end else begin : gen_no_spatz
     assign cop_issue_ready[SpatzCopro] = '0;
     assign cop_issue_resp[SpatzCopro] = '0;
@@ -1057,7 +1095,40 @@ module snitch_cc
     assign spatz_flsu_req = '0;
     assign spatz_fpu_status = '0;
     assign dca_demux_rsp[DcaSpatz] = '0;
+    assign spatz_mem_finished = '0;
+    assign spatz_mem_str_finished = '0;
+    assign spatz_busy_raw_q = 1'b0;
+    assign spatz_vlsu_cnt_q = '0;
   end
+
+  if (IsoCrossing) begin : gen_spatz_busy_sync
+    tc_sync #(
+      .Stages     (2),
+      .ResetValue (1'b0)
+    ) i_spatz_busy_sync (
+      .clk_i   (clk_d2_i),
+      .rst_ni  (rst_ni),
+      .serial_i(spatz_busy_raw_q),
+      .serial_o(spatz_busy_synced)
+    );
+
+    // signal sampled at clk_d2_i to make sure busy signal is not missed for
+    // too long that snitch already executed FENCE
+    always_ff @(posedge clk_d2_i or negedge rst_ni) begin
+      if (!rst_ni) begin
+        spatz_issue_d2_q <= 1'b0;
+      end else if (x_issue_valid) begin
+        spatz_issue_d2_q <= 1'b1;
+      end else if (!spatz_busy_synced) begin
+        spatz_issue_d2_q <= 1'b0;
+      end
+    end
+  end else begin : gen_no_iso_crossing
+    assign spatz_busy_synced = spatz_busy_raw_q;
+    assign spatz_issue_d2_q = 1'b0;
+  end
+
+  assign spatz_busy_d2 = spatz_issue_d2_q || spatz_busy_synced;
 
   /////////////////////////////////////////////
   // Mux Snitch, FPSS and Spatz LSU requests //
@@ -1305,7 +1376,7 @@ module snitch_cc
 
   // Spatz replaces the iDMA (v1 review)
   `ASSERT_INIT(IllegalSpatzAxiDmaCombo, (!EnableSpatzAxi) || (!IsaCfg.Xdma))
-  `ASSERT_INIT(SpatzAxiNeedsDmaChannel, (!EnableSpatzAxi) || (DMANumChannels > 0))
+  `ASSERT_INIT(SpatzAxiNeeds1DmaChannel, (!EnableSpatzAxi) || (DMANumChannels == 1))
   `ASSERT_INIT(SpatzAxiNeedsSpatzPorts, (!EnableSpatzAxi) || (NumSpatzMemPorts > 0))
   // Assertion for all Spatz request to all goes to 1 endpoint is at check_is_tcdm function
 

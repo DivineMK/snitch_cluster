@@ -33,6 +33,7 @@ int main() {
         asm volatile("vse64.v v0, (%0)" ::"r"(local_a));
         asm volatile("vle64.v v0, (%0)" ::"r"(b));
         asm volatile("vse64.v v0, (%0)" ::"r"(local_b));
+        asm volatile("fence" ::: "memory");
     }
 
     snrt_cluster_hw_barrier();
@@ -49,9 +50,8 @@ int main() {
         double *vc = (double *)local_c;
         for (int i = 0; i < N; i++) {
             if ((vc[i] - 6.0) > 0.01f) errs++;
-            printf("Errors: %f\n", vc[i]);
+            printf("%f\n", vc[i]);
         }
-
 
         return errs;
     }

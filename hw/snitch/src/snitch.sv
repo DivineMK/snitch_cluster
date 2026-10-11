@@ -76,6 +76,7 @@ Ports:
   en_copift_o        - Enable COPIFT queues (I2F, F2I) in FPSS.
   barrier_o          - Signals core's arrival on a cluster hardware barrier.
   barrier_i          - Signals to the core that it can depart from a cluster hardware barrier.
+  spatz_busy_i       - signal for FENCE stalls until Spatz's VLSU operations have retired
 */
 module snitch
   import snitch_pkg::*;
@@ -156,7 +157,8 @@ module snitch
   output core_events_t          core_events_o,
   output logic                  en_copift_o,
   output logic                  barrier_o,
-  input  logic                  barrier_i
+  input  logic                  barrier_i,
+  input  logic                  spatz_busy_i
 );
 
   // Unpack ISA config
@@ -1042,7 +1044,7 @@ module snitch
         end
       end
       FENCE: begin
-        fence_stall = valid_instr && !(lsu_empty && caq_empty);
+        fence_stall = valid_instr && !(lsu_empty && caq_empty && !spatz_busy_i);
         write_rd = 1'b0;
       end
       FENCE_I: begin

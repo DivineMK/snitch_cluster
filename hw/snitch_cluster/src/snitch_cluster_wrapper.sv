@@ -238,6 +238,7 @@ module snitch_cluster_wrapper
     .SsrRegs                  (SsrRegs),
     .SsrCfgs                  (SsrCfgs),
     .SpatzDoubleBw            (SpatzDoubleBw),
+    .SpatzAxiEn                (SpatzAxiEn),
     .NumSpatzOutstandingLoads (NumSpatzOutstandingLoads),
     .NumSequencerInstr        (NumSequencerInstr),
     .NumSequencerLoops        (NumSequencerLoops),

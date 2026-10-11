@@ -669,6 +669,11 @@
                                             "description": "Whether the core should be equipped with its own, not a hive-shared, private IPU.",
                                             "default": false
                                         },
+                                        "spatz_axi_enable": {
+                                            "type": "boolean",
+                                            "description": "Whether this core's Spatz VLSU may access off-cluster memory through the DMA AXI port (Spatz vector-to-AXI joiner).",
+                                            "default": false
+                                        },
                                         "num_int_outstanding_loads": {
                                             "type": "number",
                                             "description": "Number of outstanding integer loads. Determines the buffer size in the core's load/store unit.",

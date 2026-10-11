@@ -128,6 +128,9 @@ module snitch_cluster
   parameter int unsigned NumSpatzOutstandingLoads [NrCores] = '{default: 0},
   /// Per-core enable of double bandwidth for Spatz.
   parameter bit SpatzDoubleBw [NrCores] = '{default: 0},
+  /// Per-core enable of the Spatz vector-to-AXI joiner. Only cores with
+  /// exactly 1 exclusive DMA AXI channel may enable this
+  parameter bit SpatzAxiEn [NrCores] = '{default: 0},
   /// Per-core register indices for each SSR.
   parameter logic [cc_pkg::iomsb(NumSsrsMax):0][4:0]  SsrRegs [NrCores] = '{default: 0},
   /// Per-core amount of sequencer instructions for IPU and FPU if enabled.
@@ -1171,6 +1174,7 @@ module snitch_cluster
       .SsrRegs (SsrRegs[i][cc_pkg::iomsb(NumSsrs[i]):0]),
       .NumSpatzOutstandingLoads (NumSpatzOutstandingLoads[i]),
       .SpatzDoubleBw (SpatzDoubleBw[i]),
+      .EnableSpatzAxi (SpatzAxiEn[i]),
       .RegisterOffloadReq (RegisterOffloadReq),
       .RegisterOffloadRsp (RegisterOffloadRsp),
       .RegisterCoreReq (RegisterCoreReq),
@@ -1232,7 +1236,12 @@ module snitch_cluster
         tcdm_req[TcdmPortsOffs+j].q.user[0] = 1;
       end
     end
-    if (IsaCfg[i].Xdma) begin : gen_dma_connection
+    // A core's DMA AXI port is connected when it owns an iDMA (Xdma) or when
+    // its Spatz VLSU is AXI-enabled (SpatzAxiEn); the latter replaces the
+    // iDMA, which is disabled in that mode (see `IllegalSpatzAxiDmaCombo`).
+    // NOTE: each connected core must own an exclusive DMA AXI channel;
+    // sharing one channel between cores multi-drives the fabric port.
+    if (IsaCfg[i].Xdma || (IsaCfg[i].RVV && SpatzAxiEn[i])) begin : gen_dma_connection
       for (genvar j = 0; j < DMANumChannels; j++) begin : gen_dma_connection
         assign wide_axi_mst_req[SDMAMst + j] = axi_dma_req[j];
         assign axi_dma_res[j] = wide_axi_mst_rsp[SDMAMst + j];

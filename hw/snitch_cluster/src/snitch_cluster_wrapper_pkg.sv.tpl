@@ -424,6 +424,7 @@ ${ssr_cfg(core, '{reg_idx}', '/*None*/ 0', ',')}\
   localparam int unsigned SsrMuxRspDepth           [NrCores] = '{${core_cfg('ssr_mux_rsp_depth')}};
   localparam bit          SpatzDoubleBw            [NrCores] = '{${core_cfg_lambda(lambda x: int(x['spatz']['double_bw']))}};
   localparam int unsigned NumSpatzOutstandingLoads [NrCores] = '{${core_cfg_lambda(lambda x: int(x['spatz']['num_outstanding_loads']))}};
+  localparam bit          SpatzAxiEn               [NrCores] = '{${core_cfg_lambda(lambda x: int(x['spatz_axi_enable']))}};
 
 endpackage
 // verilog_lint: waive-stop package-filename
