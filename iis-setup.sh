@@ -23,7 +23,8 @@ export PATH=$PWD/util/bin:$PATH
 export PATH=$PWD/target/sim/build/bin:$PATH
 
 # Initialize submodules
-git -c submodule.nonfree.update=checkout submodule update --init --recursive
+#git -c submodule.nonfree.update=checkout submodule update --init --recursive
+git submodule update --init --recursive
 
 # Initialize Bender dependencies
 $SN_BENDER checkout
@@ -31,9 +32,12 @@ $SN_BENDER checkout
 # Bootstrap the Python environment
 # Prefix with flock to prevent race condition in managed Python installation,
 # see https://github.com/astral-sh/uv/issues/19329
+#flock-2.41 --fcntl "${HOME}/uv-ci.lock" bash -euo pipefail -c '
+#  uv sync --all-extras --all-groups --locked
+#  uv pip install -e nonfree
+#'
 flock-2.41 --fcntl "${HOME}/uv-ci.lock" bash -euo pipefail -c '
   uv sync --all-extras --all-groups --locked
-  uv pip install -e nonfree
 '
 source .venv/bin/activate
 
