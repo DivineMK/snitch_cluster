@@ -75,6 +75,8 @@ module snitch_cc
   parameter logic [cc_pkg::iomsb(NumSsrs):0][4:0] SsrRegs = '0,
   /// Spatz parameters
   parameter int unsigned NumSpatzOutstandingLoads = 4,
+  /// Maximum AXI requests in flight on Spatz's wide memory path.
+  parameter int unsigned SpatzAxiMaxOutstanding = 4,
   parameter bit          SpatzDoubleBw      = 0,
   /// Add isochronous clock-domain crossings e.g., make it possible to operate
   /// the core in a slower clock domain.
@@ -115,8 +117,9 @@ module snitch_cc
   parameter bit          EnableDca          = 0,
   /// Enable Spatz vector-to-AXI joiner (v0.1)
   /// When 0, Spatz VLSU ports go straight to TCDM (current behavior).
-  /// When 1, each VLSU port is routed by address, either to TCDM ports or AXI contiguous access are joined
-  /// to one 64B beat. DMA is disabled in this mode (`Xdma` + `EnableSpatzAxi` is illegal)
+  /// When 1, VLSU requests route by address to TCDM passthrough or the AXI
+  /// joiner, which combines contiguous accesses into one 64B beat. DMA is
+  /// disabled in this mode (`Xdma` + `EnableSpatzAxi` is illegal).
   parameter bit          EnableSpatzAxi     = 1'b1,
   /// Derived parameter *Do not override*
   localparam int unsigned NumTcdmPorts = snitch_cc_pkg::get_tcdm_ports(
@@ -320,45 +323,27 @@ module snitch_cc
   tcdm_req_t      [NumSpatzMemPorts-1:0] spatz_tcdm_req;
   tcdm_rsp_t      [NumSpatzMemPorts-1:0] spatz_tcdm_rsp;
 
-  // Spatz vector-to-AXI steering (v1 review, only used when `EnableSpatzAxi`).
-  // Full-width VLSU channels recover the high address bits (Spatz computes
-  // `rs1+offset` at full precision but the old TCDM-width channel truncated
-  // them); no Spatz RTL change. TCDM path slices low bits back off.
-  // Macro parameters:
-  // - `DataWidth`: lane payload unchanged (`ELEN == 64 == DataWidth` if `RVD`).
-  // - `AddrWidth`: == physical width by construction (`snitch_cluster.sv:1127`
-  //   binds `.AddrWidth (PhysicalAddrWidth)`); matches `tcdm_addr_base_i` and
-  //   the AXI ports, so no conversion at either consumer. Re-verify that
-  //   binding if widths ever change.
-  // - `TcdmUserWidth`: sideband untouched; keeps the TCDM slice a field copy.
+  // Extend AddrWidth to match physical addr width for AXI path
   `TCDM_TYPEDEF_REQRSP_CHAN_ALL(spatz_full, DataWidth, AddrWidth, TcdmUserWidth)
-  // Wide coalesced beat between join and converter (64B data, full address).
+  // Wide coalesced beat between join and converter (64B data, full address)
   `TCDM_TYPEDEF_ALL(spatz_wide, DMADataWidth, AddrWidth, TcdmUserWidth)
   spatz_full_req_chan_t [NumSpatzMemPorts-1:0] spatz_full_req_chan;
   logic                 [NumSpatzMemPorts-1:0] spatz_full_req_valid;
   logic                 [NumSpatzMemPorts-1:0] spatz_full_req_ready;
   spatz_full_rsp_chan_t [NumSpatzMemPorts-1:0] spatz_full_rsp_chan;
   logic                 [NumSpatzMemPorts-1:0] spatz_full_rsp_valid;
-  // TCDM-hit flag: all VLSU ports in an access are assumed to target either
-  // all AXI or all TCDM. Decoded from the transfer address against the TCDM base/mask rule.
-  logic spatz_is_tcdm;
-  // Group-level steering for depth-1 groups.
-  logic spatz_group_tcdm, spatz_group_axi;
-  // Outstanding-group tracking in `EnableSpatzAxi` mode: path of the accepted
-  // group (0: TCDM, 1: AXI) plus per-port response-pending bits.
-  logic spatz_path_q;
-  logic [NumSpatzMemPorts-1:0] spatz_pend_q;
-  // Memory fence support to sync between Spatz and Snitch
-  logic [1:0] spatz_mem_finished;
-  logic [1:0] spatz_mem_str_finished;
-  // snitch and spatz may be in different clock domain (IsoCrossing), raw is
-  // sampled by spatz
-  logic spatz_busy_raw_d, spatz_busy_raw_q;
-  // Counter for outstanding VLSU ops
-  logic [2:0] spatz_vlsu_cnt_q, spatz_vlsu_cnt_d;
-  logic       spatz_busy_synced;
-  logic       spatz_issue_d2_q;
-  logic       spatz_busy_d2;
+
+  // signals to support memory fence between Snitch and Spatz
+  // there remains accepted but not yet retired vector mem ops, computed in `spatz_controller`
+  logic spatz_vlsu_mem_busy;
+  // there remains ongoing store ops (which retire before response comes back)
+  logic spatz_ports_busy;
+  // snitch and spatz may be in different clock domain (IsoCrossing=1)
+  // signals for CDC
+  logic spatz_busy_raw_q;
+  logic spatz_busy_synced;
+  logic spatz_issue_d2_q;
+  logic spatz_busy_d2;
   // AXI-side joiner request/response (drives the DMA AXI ports when enabled).
   axi_req_t spatz_join_req;
   axi_rsp_t spatz_join_res;
@@ -869,217 +854,51 @@ module snitch_cc
       .dca_rsp_o               (dca_demux_rsp[DcaSpatz])
     );
 
-    // Convert Spatz requests: slice the full-width channels to TCDM width.
-    // Original narrow conversion (kept for reference, superseded by slicing):
-    // for (genvar p = 0; p < NumSpatzMemPorts; p++) begin: gen_spatz_tcdm_assignment
-    //   assign spatz_tcdm_req[p] = '{
-    //       q: spatz_tcdm_req_chan[p],
-    //       q_valid: spatz_tcdm_req_valid[p]
-    //     };
-    //   assign spatz_tcdm_req_ready[p] = spatz_tcdm_rsp[p].q_ready;
-    //   assign spatz_tcdm_rsp_chan[p] = spatz_tcdm_rsp[p].p;
-    //   assign spatz_tcdm_rsp_valid[p] = spatz_tcdm_rsp[p].p_valid;
-    // end
-    // `q_valid`/`q_ready` gating and the response path are steered per group
-    // in `gen_spatz_steer` below; TCDM-bound groups keep the pack path above.
-    for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_spatz_slice
-      // NOTE: spatz_full_req use PhysicalAddrWidth, spatz_tcdm use TcdmAddrWidth
-      // similar to lsu_width_converter
-      assign spatz_tcdm_req[p].q.addr  = spatz_full_req_chan[p].addr[TcdmAddrWidth-1:0];
-      assign spatz_tcdm_req[p].q.write = spatz_full_req_chan[p].write;
-      assign spatz_tcdm_req[p].q.amo   = spatz_full_req_chan[p].amo;
-      assign spatz_tcdm_req[p].q.data  = spatz_full_req_chan[p].data;
-      assign spatz_tcdm_req[p].q.strb  = spatz_full_req_chan[p].strb;
-      assign spatz_tcdm_req[p].q.user  = spatz_full_req_chan[p].user;
-    end
+    // Spatz memory interface: direct TCDM path, AXI group queue/join, response
+    // source exclusion and the *port-level* FENCE busy term (the
+    // instruction-level counter lives in `spatz_controller`).
+    spatz_mem_if #(
+      .NrPorts         (NumSpatzMemPorts),
+      .DataWidth       (DataWidth),
+      .AddrWidth       (AddrWidth),
+      .TcdmAddrWidth   (TcdmAddrWidth),
+      .WideDataWidth   (DMADataWidth),
+      .TcdmUserWidth   (TcdmUserWidth),
+      .EnableSpatzAxi     (EnableSpatzAxi),
+      .TCDMAliasEnable (TCDMAliasEnable),
+      .TCDMAliasStart  (TCDMAliasStart),
+      .spatz_req_chan_t(spatz_full_req_chan_t),
+      .spatz_rsp_chan_t(spatz_full_rsp_chan_t),
+      .tcdm_req_t      (tcdm_req_t),
+      .tcdm_rsp_t      (tcdm_rsp_t),
+      .axi_req_t       (axi_req_t),
+      .axi_rsp_t       (axi_rsp_t),
+      .axi_ar_chan_t   (axi_ar_chan_t),
+      .wide_req_t      (spatz_wide_req_t),
+      .wide_rsp_t      (spatz_wide_rsp_t)
+    ) i_spatz_mem_if (
+      .clk_i,
+      .rst_ni,
+      .tcdm_addr_base_i,
+      .spatz_req_chan_i (spatz_full_req_chan),
+       .spatz_req_valid_i(spatz_full_req_valid),
+       .spatz_req_ready_o(spatz_full_req_ready),
+      .spatz_rsp_chan_o (spatz_full_rsp_chan),
+      .spatz_rsp_valid_o(spatz_full_rsp_valid),
+      .tcdm_req_o       (spatz_tcdm_req),
+      .tcdm_rsp_i       (spatz_tcdm_rsp),
+      .axi_req_o        (spatz_join_req),
+      .axi_rsp_i        (spatz_join_res),
+      .vlsu_ports_busy_o(spatz_ports_busy)
+    );
 
-    // Spatz TCDM/AXI steering (v1 review).
-    // Disabled: transparent slice-through, identical to the original code above.
-    if (!EnableSpatzAxi) begin : gen_spatz_steer_bypass
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_port
-        assign spatz_tcdm_req[p].q_valid = spatz_full_req_valid[p];
-        assign spatz_full_req_ready[p]   = spatz_tcdm_rsp[p].q_ready;
-        assign spatz_full_rsp_chan[p]    = spatz_tcdm_rsp[p].p.data;
-        assign spatz_full_rsp_valid[p]   = spatz_tcdm_rsp[p].p_valid;
-      end
-      assign spatz_is_tcdm    = 1'b0;
-      assign spatz_group_tcdm = 1'b0;
-      assign spatz_group_axi  = 1'b0;
-      assign spatz_path_q     = 1'b0;
-      assign spatz_join_req   = '0;
-      assign spatz_join_res   = '0;
-      assign spatz_busy_raw_q = 1'b0;
-    end else begin : gen_spatz_axi
-      // TCDM address rule, same base/mask form as the LSU demux above.
-      // Assumption: every VLSU port either accesses all AXI or all TCDM.
-      // Destination is decoded from the first presenting (valid) lane.
-      localparam logic [AddrWidth-1:0] TcdmBaseMask = (addr_t'({AddrWidth{1'b1}}) << TcdmAddrWidth);
-      function automatic logic check_is_tcdm(logic [AddrWidth-1:0] addr);
-        return ((addr & TcdmBaseMask) == (tcdm_addr_base_i & TcdmBaseMask))
-            || (TCDMAliasEnable && ((addr & TcdmBaseMask) == (TCDMAliasStart & TcdmBaseMask)));
-      endfunction
-
-      always_comb begin
-        spatz_is_tcdm = 1'b0;
-        for (int p = 0; p < NumSpatzMemPorts; p++) begin
-          if (spatz_full_req_valid[p]) begin
-            spatz_is_tcdm = check_is_tcdm(spatz_full_req_chan[p].addr);
-            break;
-          end
-        end
-      end
-
-      // Assert that all valid ports in a group agree on the destination (all AXI or all TCDM).
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_assert_same_target
-        `ASSERT(SpatzPortMatchesGroupTarget_A,
-          spatz_full_req_valid[p] |-> (check_is_tcdm(spatz_full_req_chan[p].addr) == spatz_is_tcdm)
-        )
-      end
-
-      logic any_valid;
-      logic any_idle;
-      assign any_valid        = |spatz_full_req_valid;
-      assign any_idle         = (spatz_pend_q == '0);
-      // Currently any_idle (from spatz_pend) serialize all requests, forcing effective NumOutstandingLoads=1.
-      // To overcome this later on (with pipelining), we will need to replace these with per-port counter
-
-      logic [NumSpatzMemPorts-1:0] spatz_pend_d; // pending requests
-      logic spatz_path_d;
-      logic any_accept;
-      assign any_accept = |(spatz_full_req_valid & spatz_full_req_ready);
-      always_comb begin
-        spatz_pend_d = spatz_pend_q;
-        spatz_path_d = spatz_path_q;
-
-        if (any_accept) spatz_path_d = !spatz_is_tcdm;
-        for (int p = 0; p < NumSpatzMemPorts; p++) begin
-          if (spatz_full_req_valid[p] && spatz_full_req_ready[p]) begin
-            spatz_pend_d[p] = 1'b1;
-          end
-          if (spatz_full_rsp_valid[p]) spatz_pend_d[p] = 1'b0;
-        end
-      end
-      `FF(spatz_pend_q, spatz_pend_d, '0, clk_i, rst_ni)
-      `FF(spatz_path_q, spatz_path_d, '0, clk_i, rst_ni)
-      assign spatz_group_tcdm = any_valid &&  spatz_is_tcdm && any_idle;
-      assign spatz_group_axi  = any_valid && !spatz_is_tcdm && any_idle;
-
-      // Joiner slave side presents the full channels of AXI-bound groups.
-      // Joiner slave request: full-width channel plus valid (response reuses
-      // `tcdm_rsp_t`, which carries data only and already matches).
-      localparam type spatz_join_req_t = `TCDM_REQ_STRUCT(DataWidth, AddrWidth, TcdmUserWidth);
-      localparam type spatz_join_rsp_t = `TCDM_RSP_STRUCT(DataWidth);
-      spatz_join_req_t [NumSpatzMemPorts-1:0] spatz_join_slv_req;
-      spatz_join_rsp_t [NumSpatzMemPorts-1:0] spatz_join_slv_rsp;
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_join_slv
-        assign spatz_join_slv_req[p].q       = spatz_full_req_chan[p];
-        assign spatz_join_slv_req[p].q_valid = spatz_full_req_valid[p] && spatz_group_axi;
-      end
-
-      // Wide coalesced beat between join and converter.
-      spatz_wide_req_t spatz_wide_req;
-      spatz_wide_rsp_t spatz_wide_rsp;
-
-      tcdm_narrow_join #(
-        .NrPorts         (NumSpatzMemPorts),
-        .NarrowDataWidth (DataWidth),
-        .WideDataWidth   (DMADataWidth),
-        .TcdmAddrWidth   (AddrWidth),
-        .narrow_req_t    (spatz_join_req_t),
-        .narrow_rsp_t    (spatz_join_rsp_t),
-        .wide_req_t      (spatz_wide_req_t),
-        .wide_rsp_t      (spatz_wide_rsp_t)
-      ) i_spatz_narrow_join (
-        .clk_i,
-        .rst_ni,
-        .narrow_req_i (spatz_join_slv_req),
-        .narrow_rsp_o (spatz_join_slv_rsp),
-        .wide_req_o   (spatz_wide_req),
-        .wide_rsp_i   (spatz_wide_rsp)
-      );
-
-      tcdm_to_axi #(
-        .DataWidth    (DMADataWidth),
-        .TcdmAddrWidth(AddrWidth),
-        .AxiAddrWidth (AddrWidth),
-        .tcdm_req_t   (spatz_wide_req_t),
-        .tcdm_rsp_t   (spatz_wide_rsp_t),
-        .axi_req_t    (axi_req_t),
-        .axi_rsp_t    (axi_rsp_t)
-      ) i_tcdm_to_axi (
-        .clk_i,
-        .rst_ni,
-        .tcdm_req_i (spatz_wide_req),
-        .tcdm_rsp_o (spatz_wide_rsp),
-        .axi_req_o  (spatz_join_req),
-        .axi_rsp_i  (spatz_join_res)
-      );
-
-      // reuse iDMA wires
+    if (EnableSpatzAxi) begin : gen_spatz_axi_drv
       assign axi_dma_req_o[0] = spatz_join_req;
-      assign spatz_join_res = axi_dma_res_i[0];
-
-      // Steer requests to TCDM or AXI based on the address map
-      // only valid when at least 1 req is valid
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_req_steer
-        assign spatz_tcdm_req[p].q_valid = spatz_full_req_valid[p] && spatz_group_tcdm;
-        assign spatz_full_req_ready[p] = spatz_group_tcdm ? spatz_tcdm_rsp[p].q_ready :
-                                  (spatz_group_axi ? spatz_join_slv_rsp[p].q_ready : 1'b0);
-      end
-
-      // Response steering by recorded path; pend bits clear on `p_valid`.
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_rsp_steer
-        assign spatz_full_rsp_chan[p] = spatz_path_q ? spatz_join_slv_rsp[p].p.data :
-          spatz_tcdm_rsp[p].p.data;
-        assign spatz_full_rsp_valid[p] = spatz_path_q ? spatz_join_slv_rsp[p].p_valid :
-          spatz_tcdm_rsp[p].p_valid;
-      end
-
-      // Depth-1 (`spatz_pend_q`) allows at most one outstanding group, so both
-      // legs must never answer the same lane together.
-      for (genvar p = 0; p < NumSpatzMemPorts; p++) begin : gen_assert_rsp_mutex
-        `ASSERT(SpatzRspMutex,
-          !(spatz_tcdm_rsp[p].p_valid && spatz_join_slv_rsp[p].p_valid)
-        )
-      end
-
-      // restrict FENCE to only work with VLSU ops because its sole purpose is
-      // replacing snrt_dma_wait_all()
-      logic vlsu_mem_accept;
-      assign vlsu_mem_accept = cop_issue_valid[SpatzCopro] & cop_issue_ready[SpatzCopro]
-          && (cop_issue_req[SpatzCopro].instr inside
-        {spatz_riscv_instr::VLE8_V, spatz_riscv_instr::VLE16_V,
-        spatz_riscv_instr::VLE32_V, spatz_riscv_instr::VLE64_V,
-        spatz_riscv_instr::VLSE8_V, spatz_riscv_instr::VLSE16_V,
-        spatz_riscv_instr::VLSE32_V, spatz_riscv_instr::VLSE64_V,
-        spatz_riscv_instr::VLOXEI8_V, spatz_riscv_instr::VLOXEI16_V,
-        spatz_riscv_instr::VLOXEI32_V, spatz_riscv_instr::VLOXEI64_V,
-        spatz_riscv_instr::VLUXEI8_V, spatz_riscv_instr::VLUXEI16_V,
-        spatz_riscv_instr::VLUXEI32_V, spatz_riscv_instr::VLUXEI64_V,
-        spatz_riscv_instr::VSE8_V, spatz_riscv_instr::VSE16_V,
-        spatz_riscv_instr::VSE32_V, spatz_riscv_instr::VSE64_V,
-        spatz_riscv_instr::VSSE8_V, spatz_riscv_instr::VSSE16_V,
-        spatz_riscv_instr::VSSE32_V, spatz_riscv_instr::VSSE64_V,
-        spatz_riscv_instr::VSOXEI8_V, spatz_riscv_instr::VSOXEI16_V,
-        spatz_riscv_instr::VSOXEI32_V, spatz_riscv_instr::VSOXEI64_V,
-        spatz_riscv_instr::VSUXEI8_V, spatz_riscv_instr::VSUXEI16_V,
-        spatz_riscv_instr::VSUXEI32_V, spatz_riscv_instr::VSUXEI64_V});
-
-      always_comb begin
-        spatz_vlsu_cnt_d = spatz_vlsu_cnt_q;
-        if (vlsu_mem_accept && !spatz_mem_finished[1] && spatz_vlsu_cnt_q != '1)
-          spatz_vlsu_cnt_d = spatz_vlsu_cnt_q + 1'b1;
-        else if (!vlsu_mem_accept && spatz_mem_finished[1] && spatz_vlsu_cnt_q != '0)
-          spatz_vlsu_cnt_d = spatz_vlsu_cnt_q - 1'b1;
-      end
-      `FF(spatz_vlsu_cnt_q, spatz_vlsu_cnt_d, '0, clk_i, rst_ni)
-
-      // Busy = counted-but-uncommitted vector ops + live request/pending
-      // traffic (store-response tail W2, past finish).
-      assign spatz_busy_raw_d = (spatz_vlsu_cnt_q != '0)
-          || (|spatz_full_req_valid) || (|spatz_pend_q);
-      `FF(spatz_busy_raw_q, spatz_busy_raw_d, '0, clk_i, rst_ni)
-    end : gen_spatz_axi
+      assign spatz_join_res   = axi_dma_res_i[0];
+    end else begin : gen_no_spatz_axi_drv
+      assign spatz_join_res = '0;
+    end
+    assign spatz_busy_raw_q = EnableSpatzAxi ? (spatz_vlsu_mem_busy || spatz_ports_busy) : 1'b0;
   end else begin : gen_no_spatz
     assign cop_issue_ready[SpatzCopro] = '0;
     assign cop_issue_resp[SpatzCopro] = '0;
@@ -1095,10 +914,7 @@ module snitch_cc
     assign spatz_flsu_req = '0;
     assign spatz_fpu_status = '0;
     assign dca_demux_rsp[DcaSpatz] = '0;
-    assign spatz_mem_finished = '0;
-    assign spatz_mem_str_finished = '0;
     assign spatz_busy_raw_q = 1'b0;
-    assign spatz_vlsu_cnt_q = '0;
   end
 
   if (IsoCrossing) begin : gen_spatz_busy_sync
