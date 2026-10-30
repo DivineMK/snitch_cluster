@@ -81,6 +81,7 @@ SN_APPS += $(SN_ROOT)/sw/kernels/blas/gemv
 SN_APPS += $(SN_ROOT)/sw/kernels/blas/dot
 SN_APPS += $(SN_ROOT)/sw/kernels/blas/syrk
 SN_APPS += $(SN_ROOT)/sw/kernels/blas/spatz-axpy
+SN_APPS += $(SN_ROOT)/sw/kernels/blas/spatz-dma
 SN_APPS += $(SN_ROOT)/sw/kernels/blas/spatz-fmatmul
 SN_APPS += $(SN_ROOT)/sw/kernels/dnn/batchnorm
 # SN_APPS += $(SN_ROOT)/sw/kernels/dnn/conv2d
