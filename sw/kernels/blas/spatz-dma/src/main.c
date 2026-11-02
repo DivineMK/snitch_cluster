@@ -63,6 +63,25 @@ int main() {
 
     snrt_cluster_hw_barrier();
 
+    const unsigned int boundary_offset = (4096 - 256) / sizeof(double);
+    const unsigned int boundary_count = 64;
+    if (snrt_is_dm_core()) {
+        unsigned int t0 = snrt_mcycle();
+        // Cross a 4 KiB boundary on both the AXI read and write paths.
+        snrt_dma_start_1d(local_b + boundary_offset, a + boundary_offset,
+                          boundary_count * sizeof(double));
+        snrt_dma_wait_all();
+        snrt_dma_start_1d(b + boundary_offset, local_b + boundary_offset,
+                          boundary_count * sizeof(double));
+        // Exercise a single 64 B wide read and write beat.
+        snrt_dma_start_1d(local_b, a, 8 * sizeof(double));
+        snrt_dma_wait_all();
+        snrt_dma_start_1d(b, local_b, 8 * sizeof(double));
+        snrt_dma_wait_all();
+        printf("DMA boundary/single-beat cycles: %u\r\n",
+               snrt_mcycle() - t0);
+    }
+
     return 0;
 }
 #endif

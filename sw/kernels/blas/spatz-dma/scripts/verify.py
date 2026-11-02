@@ -21,6 +21,10 @@ class SpatzDmaVerifier(Verifier):
         a = self.get_input_from_symbol('a', 'double')
         b = self.get_input_from_symbol('b', 'double')
         expected_b = b.copy()
+        # This 512 B transfer begins 256 B before a 4 KiB boundary.
+        expected_b[480:544] = a[480:544]
+        # The one-wide-beat transfer copies the first 64 B as well.
+        expected_b[:8] = a[:8]
         return np.concatenate((a, expected_b))
 
     def check_results(self, *args):
