@@ -16,8 +16,8 @@ module tcdm_narrow_join
     parameter int unsigned NarrowDataWidth = 64,
     parameter int unsigned WideDataWidth = 512,
     parameter int unsigned TcdmAddrWidth = 48,
-    // One lane mask is stored per accepted wide beat, so this bounds the number
-    // of beats that can be in flight towards the AXI converter.
+    // One lane mask is stored per accepted read beat, so this bounds the number
+    // of read beats that can be in flight towards the AXI converter.
     parameter int unsigned RspMaskDepth = 4,
     parameter type narrow_req_t = logic,
     parameter type narrow_rsp_t = logic,
@@ -32,8 +32,12 @@ module tcdm_narrow_join
     // Wide side: single coalesced TCDM request per group.
     output wide_req_t                 wide_req_o,
     input  wide_rsp_t                 wide_rsp_i,
+
+    input  logic                      write_busy_i,  // write beats are acked at accept
     output logic                      rsp_mask_valid_o,
     output logic                      request_fire_o,
+
+    output logic                      wr_fire_o,     // write beat accepted
     output logic                      response_fire_o
 );
 
@@ -104,8 +108,14 @@ module tcdm_narrow_join
   lane_mask_t rsp_mask_wdata, rsp_mask_rdata;
   logic rsp_mask_valid, rsp_mask_ready;
   assign rsp_mask_wdata = lane_sel;
-  assign request_fire_o = join_oup_valid && wide_rsp_i.q_ready && rsp_mask_ready;
-  assign response_fire_o = wide_rsp_i.p_valid && rsp_mask_valid;
+  // Write beats are acked by the converter at the request handshake, so they
+  // take no lane-mask entry; the FIFO only tracks read responses.
+  logic wr_beat;
+  assign wr_beat = join_write && write_busy_i;
+  assign request_fire_o = join_oup_valid && wide_rsp_i.q_ready &&
+                          (rsp_mask_ready || wr_beat);
+  assign wr_fire_o = request_fire_o && wr_beat;
+  assign response_fire_o = wide_rsp_i.p_valid && rsp_mask_valid && !wr_beat;
   assign rsp_mask_valid_o = rsp_mask_valid;
   assign wide_req_o.q_valid = join_oup_valid && rsp_mask_ready;
   assign join_oup_ready = wide_rsp_i.q_ready && rsp_mask_ready;
@@ -121,7 +131,7 @@ module tcdm_narrow_join
       .flush_i    ( 1'b0 ),
       .usage_o    ( /* unused */ ),
       .data_i     ( rsp_mask_wdata ),
-      .valid_i    ( request_fire_o ),
+      .valid_i    ( request_fire_o && !wr_beat ),
       .ready_o    ( rsp_mask_ready ),
       .data_o     ( rsp_mask_rdata ),
       .valid_o    ( rsp_mask_valid ),
@@ -130,7 +140,8 @@ module tcdm_narrow_join
 
   for (genvar i = 0; i < NrPorts; i++) begin : gen_narrow_rsp
     assign narrow_rsp_o[i].q_ready = join_inp_ready[i];
-    assign narrow_rsp_o[i].p_valid = wide_rsp_i.p_valid && rsp_mask_valid && rsp_mask_rdata[i];
+    assign narrow_rsp_o[i].p_valid = (wr_beat && request_fire_o && lane_sel[i]) ||
+                               (wide_rsp_i.p_valid && rsp_mask_valid && rsp_mask_rdata[i]);
     assign narrow_rsp_o[i].p.data  = wide_rsp_i.p.data[i*NarrowDataWidth+:NarrowDataWidth];
   end
 
