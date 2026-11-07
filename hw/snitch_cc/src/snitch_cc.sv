@@ -77,6 +77,8 @@ module snitch_cc
   parameter int unsigned NumSpatzOutstandingLoads = 4,
   /// Maximum AXI transactions in flight on Spatz's wide memory path
   parameter int unsigned SpatzAxiMaxOutstanding = 4,
+  /// Maximum AXI write bursts in flight
+  parameter int unsigned SpatzAxiMaxWriteOutstanding = 2,
   parameter bit          SpatzDoubleBw      = 0,
   /// Add isochronous clock-domain crossings e.g., make it possible to operate
   /// the core in a slower clock domain.
@@ -786,6 +788,12 @@ module snitch_cc
   ///////////
 
   if (IsaCfg.RVV) begin : gen_spatz
+    localparam int unsigned SpatzMaxBurstBeats =
+        (spatz_pkg::VLEN * 8) / (NumSpatzMemPorts * DataWidth);
+    localparam int unsigned SpatzBytesWidth = $bits(spatz_pkg::vlen_t);
+    spatz_pkg::vlen_t [NumSpatzMemPorts-1:0] spatz_full_bytes;
+    logic             [NumSpatzMemPorts-1:0] spatz_full_contiguous;
+
     spatz #(
       .NrMemPorts         (NumSpatzMemPorts),
       .NumOutstandingLoads(NumSpatzOutstandingLoads),
@@ -823,6 +831,8 @@ module snitch_cc
       .spatz_mem_req_o         (spatz_full_req_chan),
       .spatz_mem_req_valid_o   (spatz_full_req_valid),
       .spatz_mem_req_ready_i   (spatz_full_req_ready),
+      .spatz_mem_bytes_o       (spatz_full_bytes),
+      .spatz_mem_contiguous_o  (spatz_full_contiguous),
       .spatz_mem_rsp_i         (spatz_full_rsp_chan),
       .spatz_mem_rsp_valid_i   (spatz_full_rsp_valid),
       .spatz_mem_finished_o    (/* TODO: wire to fence instruction */),
@@ -843,13 +853,16 @@ module snitch_cc
       axi_rsp_t spatz_join_res;
 
       spatz_mem_if #(
-        .NrPorts         (NumSpatzMemPorts),
-        .DataWidth       (DataWidth),
-        .AddrWidth       (AddrWidth),
-        .TcdmAddrWidth   (TcdmAddrWidth),
-        .WideDataWidth   (DMADataWidth),
-        .TcdmUserWidth   (TcdmUserWidth),
+        .NrPorts            (NumSpatzMemPorts),
+        .DataWidth          (DataWidth),
+        .AddrWidth          (AddrWidth),
+        .TcdmAddrWidth      (TcdmAddrWidth),
+        .WideDataWidth      (DMADataWidth),
+        .TcdmUserWidth      (TcdmUserWidth),
+        .MaxBurstBeats      (SpatzMaxBurstBeats),
+        .BytesWidth         (SpatzBytesWidth),
         .MaxOutstanding     (SpatzAxiMaxOutstanding),
+        .MaxWriteOutstanding(SpatzAxiMaxWriteOutstanding),
         .TcdmMaxOutstanding (NumSpatzOutstandingLoads),
         .TCDMAliasEnable    (TCDMAliasEnable),
         .TCDMAliasStart     (TCDMAliasStart),
@@ -869,6 +882,8 @@ module snitch_cc
         .spatz_req_chan_i (spatz_full_req_chan),
         .spatz_req_valid_i(spatz_full_req_valid),
         .spatz_req_ready_o(spatz_full_req_ready),
+        .spatz_req_bytes_i(spatz_full_bytes),
+        .spatz_req_contiguous_i(spatz_full_contiguous),
         .spatz_rsp_chan_o (spatz_full_rsp_chan),
         .spatz_rsp_valid_o(spatz_full_rsp_valid),
         .tcdm_req_o       (spatz_tcdm_req),

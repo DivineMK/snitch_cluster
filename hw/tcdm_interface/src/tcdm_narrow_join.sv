@@ -35,10 +35,10 @@ module tcdm_narrow_join
 
     input  logic                      write_busy_i,  // write beats are acked at accept
     output logic                      rsp_mask_valid_o,
-    output logic                      request_fire_o,
+    output logic                      request_accept_o,
 
-    output logic                      wr_fire_o,     // write beat accepted
-    output logic                      response_fire_o
+    output logic                      write_beat_accept_o,  // write beat accepted
+    output logic                      response_accept_o
 );
 
   localparam int unsigned NarrowStrbWidth = NarrowDataWidth / 8;
@@ -110,12 +110,12 @@ module tcdm_narrow_join
   assign rsp_mask_wdata = lane_sel;
   // Write beats are acked by the converter at the request handshake, so they
   // take no lane-mask entry; the FIFO only tracks read responses.
-  logic wr_beat;
-  assign wr_beat = join_write && write_busy_i;
-  assign request_fire_o = join_oup_valid && wide_rsp_i.q_ready &&
-                          (rsp_mask_ready || wr_beat);
-  assign wr_fire_o = request_fire_o && wr_beat;
-  assign response_fire_o = wide_rsp_i.p_valid && rsp_mask_valid && !wr_beat;
+  logic write_beat;
+  assign write_beat = join_write && write_busy_i;
+  assign request_accept_o = join_oup_valid && wide_rsp_i.q_ready &&
+                            (rsp_mask_ready || write_beat);
+  assign write_beat_accept_o = request_accept_o && write_beat;
+  assign response_accept_o = wide_rsp_i.p_valid && rsp_mask_valid && !write_beat;
   assign rsp_mask_valid_o = rsp_mask_valid;
   assign wide_req_o.q_valid = join_oup_valid && rsp_mask_ready;
   assign join_oup_ready = wide_rsp_i.q_ready && rsp_mask_ready;
@@ -131,16 +131,16 @@ module tcdm_narrow_join
       .flush_i    ( 1'b0 ),
       .usage_o    ( /* unused */ ),
       .data_i     ( rsp_mask_wdata ),
-      .valid_i    ( request_fire_o && !wr_beat ),
+      .valid_i    ( request_accept_o && !write_beat ),
       .ready_o    ( rsp_mask_ready ),
       .data_o     ( rsp_mask_rdata ),
       .valid_o    ( rsp_mask_valid ),
-      .ready_i    ( response_fire_o )
+      .ready_i    ( response_accept_o )
   );
 
   for (genvar i = 0; i < NrPorts; i++) begin : gen_narrow_rsp
     assign narrow_rsp_o[i].q_ready = join_inp_ready[i];
-    assign narrow_rsp_o[i].p_valid = (wr_beat && request_fire_o && lane_sel[i]) ||
+    assign narrow_rsp_o[i].p_valid = (write_beat && request_accept_o && lane_sel[i]) ||
                                (wide_rsp_i.p_valid && rsp_mask_valid && rsp_mask_rdata[i]);
     assign narrow_rsp_o[i].p.data  = wide_rsp_i.p.data[i*NarrowDataWidth+:NarrowDataWidth];
   end
