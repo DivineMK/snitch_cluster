@@ -790,9 +790,10 @@ module snitch_cc
   if (IsaCfg.RVV) begin : gen_spatz
     localparam int unsigned SpatzMaxBurstBeats =
         (spatz_pkg::VLEN * 8) / (NumSpatzMemPorts * DataWidth);
+    localparam int unsigned SpatzLenBeatsWidth = cc_pkg::cnt_width(SpatzMaxBurstBeats);
     localparam int unsigned SpatzBytesWidth = $bits(spatz_pkg::vlen_t);
-    spatz_pkg::vlen_t [NumSpatzMemPorts-1:0] spatz_full_bytes;
-    logic             [NumSpatzMemPorts-1:0] spatz_full_contiguous;
+    logic [SpatzLenBeatsWidth-1:0] spatz_full_len_beats;
+    logic spatz_full_contiguous;
 
     spatz #(
       .NrMemPorts         (NumSpatzMemPorts),
@@ -832,6 +833,7 @@ module snitch_cc
       .spatz_mem_req_valid_o   (spatz_full_req_valid),
       .spatz_mem_req_ready_i   (spatz_full_req_ready),
       .spatz_mem_bytes_o       (spatz_full_bytes),
+      .spatz_mem_len_beats_o   (spatz_full_len_beats),
       .spatz_mem_contiguous_o  (spatz_full_contiguous),
       .spatz_mem_rsp_i         (spatz_full_rsp_chan),
       .spatz_mem_rsp_valid_i   (spatz_full_rsp_valid),
@@ -860,6 +862,7 @@ module snitch_cc
         .WideDataWidth      (DMADataWidth),
         .TcdmUserWidth      (TcdmUserWidth),
         .MaxBurstBeats      (SpatzMaxBurstBeats),
+        .LenBeatsWidth      (SpatzLenBeatsWidth),
         .BytesWidth         (SpatzBytesWidth),
         .MaxOutstanding     (SpatzAxiMaxOutstanding),
         .MaxWriteOutstanding(SpatzAxiMaxWriteOutstanding),
@@ -882,7 +885,7 @@ module snitch_cc
         .spatz_req_chan_i (spatz_full_req_chan),
         .spatz_req_valid_i(spatz_full_req_valid),
         .spatz_req_ready_o(spatz_full_req_ready),
-        .spatz_req_bytes_i(spatz_full_bytes),
+        .spatz_req_len_beats_i(spatz_full_len_beats),
         .spatz_req_contiguous_i(spatz_full_contiguous),
         .spatz_rsp_chan_o (spatz_full_rsp_chan),
         .spatz_rsp_valid_o(spatz_full_rsp_valid),

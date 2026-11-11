@@ -5,6 +5,7 @@
 // Generic single-port wide TCDM to AXI bridge.
 //
 // Need from input bytes_i (remaining bytes of the instruction) and contiguous_i
+// Need from input len_beats_i (remaining beats of the run)
 //
 // Assumptions (checked by assertions unless noted):
 // - a beat address is aligned to `DataWidth`; `contiguous_i` gates bursting
@@ -31,6 +32,7 @@ module tcdm_to_axi
     parameter int unsigned MaxBurstLen = 8,
     // Derived parameter
     parameter int unsigned BurstLenWidth = cc_pkg::cnt_width(MaxBurstLen),
+    parameter int unsigned LenBeatsWidth = BurstLenWidth,
     parameter type tcdm_req_t = logic,
     parameter type tcdm_rsp_t = logic,
     parameter type axi_req_t = logic,
@@ -43,6 +45,7 @@ module tcdm_to_axi
     input  tcdm_req_t tcdm_req_i,
     input  logic [AxiAddrWidth-1:0] bytes_i,
     input  logic contiguous_i,
+    input  logic [LenBeatsWidth-1:0] len_beats_i,
     input  logic tcdm_read_rsp_ready_i,
     output logic write_busy_o,
     output tcdm_rsp_t tcdm_rsp_o,
@@ -55,12 +58,10 @@ module tcdm_to_axi
   localparam int unsigned OffsetWidth = $clog2(BeatBytes);
 
   // burst splitting signals
-  logic [AxiAddrWidth-1:0] bytes_remaining_d, bytes_remaining_q;
-  logic [AxiAddrWidth-1:0] bytes_remaining;
   logic [BurstLenWidth-1:0] burst_len; // = num_beats - 1
 
   // Read and write are mutually exclusive on this source and AXI ID.
-  logic read_ar_outstanding, read_tcdm_pending;
+  logic read_ar_outstanding, read_burst_active;
   logic write_busy;
 
   // Read signals
@@ -77,13 +78,21 @@ module tcdm_to_axi
   logic read_data_valid;
 
   // Write signals
+  typedef struct packed {
+    logic [AxiAddrWidth-1:0] addr;
+    logic [BurstLenWidth-1:0] len;
+  } write_aw_t;
+  write_aw_t write_aw_fifo_data;
+  logic write_aw_fifo_valid, write_aw_fifo_ready;
+  logic write_aw_capture;
+
   logic write_w_valid, write_w_last, write_w_beat_accept;
   logic [BurstLenWidth-1:0] write_beats_left;
 
   logic write_not_empty;
   logic write_full;
-  logic write_aw_valid, write_aw_accept;
-  logic write_tcdm_req, write_tcdm_pending, write_last_beat;
+  logic write_aw_valid;
+  logic write_tcdm_req, write_burst_active, write_first_w, write_last_beat;
 
   ////////////////////////////////////////////////////////////////////////////
   // Burst splitting
@@ -95,29 +104,9 @@ module tcdm_to_axi
       .MaxBurstLen    (MaxBurstLen)
   ) i_burst_splitter (
       .addr_i            (tcdm_req_i.q.addr),
-      .bytes_remaining_i (bytes_remaining),
       .contiguous_i,
       .burst_len_o       (burst_len)
   );
-
-  assign bytes_remaining = (bytes_remaining_q == '0) ? bytes_i : bytes_remaining_q;
-
-  always_comb begin : proc_bytes_remaining
-    bytes_remaining_d = bytes_remaining_q;
-    if (read_tcdm_accept || write_w_beat_accept) begin
-      if (!contiguous_i) begin
-        bytes_remaining_d = '0;
-      end else begin
-        bytes_remaining_d = (bytes_remaining > BeatBytes) ?
-                            bytes_remaining - BeatBytes : '0;
-      end
-    end
-  end
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) bytes_remaining_q <= '0;
-    else         bytes_remaining_q <= bytes_remaining_d;
-  end
 
   ////////////////////////////////////////////////////////////////////////////
   // Read path
@@ -129,15 +118,15 @@ module tcdm_to_axi
   assign read_data           = axi_rsp_i.r.data;
   assign read_ar_ready       = axi_rsp_i.ar_ready;
 
-  assign read_tcdm_pending = |read_beats_left;
+  assign read_burst_active = |read_beats_left;
   assign read_tcdm_req  = tcdm_req_i.q_valid && !tcdm_req_i.q.write;
   assign read_ar_accept = read_ar_valid && read_ar_ready;
-  assign read_tcdm_beat_accept = (read_tcdm_req && read_tcdm_pending);
+  assign read_tcdm_beat_accept = (read_tcdm_req && read_burst_active);
   assign read_tcdm_accept = read_ar_accept || read_tcdm_beat_accept;
+  assign read_ar_valid   = !write_busy && read_tcdm_req &&
+                           !read_burst_active && !read_ar_full;
 
   always_comb begin : proc_read_ar
-    read_ar_valid   = !write_busy && read_tcdm_req &&
-                      !read_tcdm_pending && !read_ar_full;
     read_ar_d       = '0;
     read_ar_d.addr  = tcdm_req_i.q.addr;
     read_ar_d.len   = $bits(read_ar_d.len)'(burst_len);
@@ -201,21 +190,41 @@ module tcdm_to_axi
   ////////////////////////////////////////////////////////////////////////////
 
   assign write_tcdm_req     = tcdm_req_i.q_valid && tcdm_req_i.q.write;
-  assign write_tcdm_pending = |write_beats_left;
+  assign write_burst_active = |write_beats_left;
 
-  assign write_aw_valid  = write_tcdm_req && !read_ar_outstanding &&
-                           !write_tcdm_pending && !write_full;
-  assign write_aw_accept = write_aw_valid && axi_rsp_i.aw_ready;
-  assign write_w_valid   = write_tcdm_req &&
-                           (write_tcdm_pending || write_aw_accept);
-  assign write_last_beat = write_tcdm_pending ?
-                           (write_beats_left == BurstLenWidth'(1)) :
-                           (burst_len == '0);
+  assign write_w_valid = write_tcdm_req &&
+                            (write_burst_active ||
+                             (write_first_w && !read_ar_outstanding &&
+                              !write_full && write_aw_fifo_ready));
+  assign write_first_w    = write_tcdm_req && !write_burst_active;
+  assign write_aw_capture = write_w_beat_accept && write_first_w;
+  assign write_aw_valid   = write_aw_fifo_valid;
+  assign write_last_beat  = write_burst_active ?
+                            (write_beats_left == BurstLenWidth'(1)) :
+                            (burst_len == '0);
   assign write_w_last        = write_w_valid && write_last_beat;
   assign write_w_beat_accept = write_w_valid && axi_rsp_i.w_ready;
-  assign write_busy          = write_aw_valid || write_tcdm_pending ||
+  assign write_busy          = write_w_valid || write_burst_active ||
                                write_not_empty;
   assign write_busy_o = write_busy;
+
+  cc_stream_fifo #(
+      .FallThrough(1'b1),
+      .Depth      (WriteAwFifoDepth),
+      .data_t     (write_aw_t)
+  ) i_write_aw_fifo (
+      .clk_i,
+      .rst_ni,
+      .clr_i  (1'b0),
+      .flush_i(1'b0),
+      .usage_o(/* unused */),
+      .data_i ({tcdm_req_i.q.addr, burst_len}),
+      .valid_i(write_aw_capture),
+      .ready_o(write_aw_fifo_ready),
+      .data_o (write_aw_fifo_data),
+      .valid_o(write_aw_fifo_valid),
+      .ready_i(axi_rsp_i.aw_ready)
+  );
 
   cc_credit_counter #(
       .NumCredits     (MaxWriteOutstanding),
@@ -225,7 +234,7 @@ module tcdm_to_axi
       .rst_ni,
       .clr_i        (1'b0),
       .credit_o     (/* unused */),
-      .credit_give_i(write_aw_accept),
+      .credit_give_i(write_aw_capture),
       .credit_take_i(axi_rsp_i.b_valid && axi_req_o.b_ready),
       .credit_left_o(write_not_empty),
       .credit_crit_o(/* unused */),
@@ -239,10 +248,10 @@ module tcdm_to_axi
       .rst_ni,
       .clr_i     (1'b0),
       .en_i      (write_w_beat_accept),
-      .load_i    (write_aw_accept),
+      .load_i    (write_aw_capture),
       .down_i    (1'b1),
       .delta_i   (BurstLenWidth'(1)),
-      .d_i       (burst_len + !write_w_beat_accept),
+      .d_i       (burst_len),
       .q_o       (write_beats_left),
       .overflow_o(/* unused */)
   );
@@ -264,8 +273,8 @@ module tcdm_to_axi
     axi_req_o.b_ready = 1'b1;
     if (write_busy) begin
       axi_req_o.aw = '0;
-      axi_req_o.aw.addr = tcdm_req_i.q.addr;
-      axi_req_o.aw.len = $bits(axi_req_o.aw.len)'(burst_len);
+      axi_req_o.aw.addr = write_aw_fifo_data.addr;
+      axi_req_o.aw.len = $bits(axi_req_o.aw.len)'(write_aw_fifo_data.len);
       axi_req_o.aw.size = $bits(axi_req_o.aw.size)'(OffsetWidth);
       axi_req_o.aw.burst = axi_pkg::BURST_INCR;
       axi_req_o.aw_valid = write_aw_valid;
@@ -288,18 +297,16 @@ module tcdm_to_axi
   `ASSERT_INIT(NonzeroMaxBurstLen, (MaxBurstLen > 0))
   `ASSERT_INIT(MaxBurstFitsAxiLen, (MaxBurstLen <= 256))
   `ASSERT(SpatzReadBurstAddress_A,
-          read_tcdm_pending && read_tcdm_accept |->
+          read_burst_active && read_tcdm_accept |->
               (tcdm_req_i.q.addr == read_feed_next_addr_q))
   `ASSERT(SpatzReadResponseOkay_A,
           read_r_tcdm_accept |-> (axi_rsp_i.r.resp == axi_pkg::RESP_OKAY))
   // input read burst addr needs to be aligned to AXI DataWidth
   `ASSERT(SpatzReadBurstAligned_A,
-          read_ar_valid && contiguous_i |->
+          read_ar_valid && (burst_len != '0) |->
               (tcdm_req_i.q.addr[OffsetWidth-1:0] == '0))
-  `ASSERT(SpatzReadBeatMetadata_A,
-          read_tcdm_pending && read_tcdm_req |-> contiguous_i)
   `ASSERT(SpatzReadBeatNoWriteBurst_A,
-          read_tcdm_pending |-> !write_busy)
+          read_burst_active |-> !write_busy)
   `ASSERT(SpatzWriteBeatNoRead_A,
           write_busy |-> !read_ar_outstanding)
   // Catch AMO and AXI errors
