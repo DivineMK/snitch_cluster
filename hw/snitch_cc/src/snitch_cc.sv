@@ -76,7 +76,7 @@ module snitch_cc
   /// Spatz parameters
   parameter int unsigned NumSpatzOutstandingLoads = 4,
   /// Maximum AXI transactions in flight on Spatz's wide memory path
-  parameter int unsigned SpatzAxiMaxOutstanding = 4,
+  parameter int unsigned SpatzAxiMaxReadOutstanding = 4,
   /// Maximum AXI write bursts in flight
   parameter int unsigned SpatzAxiMaxWriteOutstanding = 2,
   parameter bit          SpatzDoubleBw      = 0,
@@ -789,10 +789,9 @@ module snitch_cc
 
   if (IsaCfg.RVV) begin : gen_spatz
     localparam int unsigned SpatzMaxBurstBeats =
-        (spatz_pkg::VLEN * 8) / (NumSpatzMemPorts * DataWidth);
-    localparam int unsigned SpatzLenBeatsWidth = cc_pkg::cnt_width(SpatzMaxBurstBeats);
+        (spatz_pkg::VLEN * 8) / (NumSpatzMemPorts * DataWidth) + 1;
     localparam int unsigned SpatzBytesWidth = $bits(spatz_pkg::vlen_t);
-    logic [SpatzLenBeatsWidth-1:0] spatz_full_len_beats;
+    logic [SpatzBytesWidth-1:0] spatz_full_len_bytes;
     logic spatz_full_contiguous;
 
     spatz #(
@@ -832,8 +831,7 @@ module snitch_cc
       .spatz_mem_req_o         (spatz_full_req_chan),
       .spatz_mem_req_valid_o   (spatz_full_req_valid),
       .spatz_mem_req_ready_i   (spatz_full_req_ready),
-      .spatz_mem_bytes_o       (spatz_full_bytes),
-      .spatz_mem_len_beats_o   (spatz_full_len_beats),
+      .spatz_mem_len_bytes_o   (spatz_full_len_bytes),
       .spatz_mem_contiguous_o  (spatz_full_contiguous),
       .spatz_mem_rsp_i         (spatz_full_rsp_chan),
       .spatz_mem_rsp_valid_i   (spatz_full_rsp_valid),
@@ -862,9 +860,8 @@ module snitch_cc
         .WideDataWidth      (DMADataWidth),
         .TcdmUserWidth      (TcdmUserWidth),
         .MaxBurstBeats      (SpatzMaxBurstBeats),
-        .LenBeatsWidth      (SpatzLenBeatsWidth),
         .BytesWidth         (SpatzBytesWidth),
-        .MaxOutstanding     (SpatzAxiMaxOutstanding),
+        .MaxReadOutstanding (SpatzAxiMaxReadOutstanding),
         .MaxWriteOutstanding(SpatzAxiMaxWriteOutstanding),
         .TcdmMaxOutstanding (NumSpatzOutstandingLoads),
         .TCDMAliasEnable    (TCDMAliasEnable),
@@ -885,7 +882,7 @@ module snitch_cc
         .spatz_req_chan_i (spatz_full_req_chan),
         .spatz_req_valid_i(spatz_full_req_valid),
         .spatz_req_ready_o(spatz_full_req_ready),
-        .spatz_req_len_beats_i(spatz_full_len_beats),
+        .spatz_req_len_bytes_i(spatz_full_len_bytes),
         .spatz_req_contiguous_i(spatz_full_contiguous),
         .spatz_rsp_chan_o (spatz_full_rsp_chan),
         .spatz_rsp_valid_o(spatz_full_rsp_valid),

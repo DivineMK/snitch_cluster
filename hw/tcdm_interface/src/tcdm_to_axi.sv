@@ -4,11 +4,9 @@
 
 // Generic single-port wide TCDM to AXI bridge.
 //
-// Need from input bytes_i (remaining bytes of the instruction) and contiguous_i
 // Need from input len_beats_i (remaining beats of the run)
 //
 // Assumptions (checked by assertions unless noted):
-// - a beat address is aligned to `DataWidth`; `contiguous_i` gates bursting
 // - requests & responses arrive in order (single AXI ID)
 //
 // Reads:
@@ -27,12 +25,12 @@ module tcdm_to_axi
     parameter int unsigned DataWidth = 512,
     parameter int unsigned TcdmAddrWidth = 48,
     parameter int unsigned AxiAddrWidth = 48,
-    parameter int unsigned MaxOutstanding = 4,
+    parameter int unsigned MaxReadOutstanding = 4,
     parameter int unsigned MaxWriteOutstanding = 2,
-    parameter int unsigned MaxBurstLen = 8,
-    // Derived parameter
-    parameter int unsigned BurstLenWidth = cc_pkg::cnt_width(MaxBurstLen),
-    parameter int unsigned LenBeatsWidth = BurstLenWidth,
+    parameter int unsigned MaxBurstBeats = 8,
+    // Derived parameters. DO NOT CHANGE!
+    localparam int unsigned LenBeatsWidth = cc_pkg::cnt_width(MaxBurstBeats),
+    localparam int unsigned LenAxiWidth  = cc_pkg::idx_width(MaxBurstBeats),
     parameter type tcdm_req_t = logic,
     parameter type tcdm_rsp_t = logic,
     parameter type axi_req_t = logic,
@@ -43,8 +41,6 @@ module tcdm_to_axi
     input  logic      rst_ni,
     // TCDM slave: one coalesced wide beat per request handshake.
     input  tcdm_req_t tcdm_req_i,
-    input  logic [AxiAddrWidth-1:0] bytes_i,
-    input  logic contiguous_i,
     input  logic [LenBeatsWidth-1:0] len_beats_i,
     input  logic tcdm_read_rsp_ready_i,
     output logic write_busy_o,
@@ -56,18 +52,18 @@ module tcdm_to_axi
 
   localparam int unsigned BeatBytes = DataWidth / 8;
   localparam int unsigned OffsetWidth = $clog2(BeatBytes);
+  localparam int unsigned WriteAwFifoDepth = MaxWriteOutstanding;
 
   // burst splitting signals
-  logic [BurstLenWidth-1:0] burst_len; // = num_beats - 1
+  logic [LenAxiWidth-1:0] len_axi; // = num_beats - 1
 
-  // Read and write are mutually exclusive on this source and AXI ID.
   logic read_ar_outstanding, read_burst_active;
   logic write_busy;
 
   // Read signals
   axi_ar_chan_t read_ar, read_ar_d, read_ar_q;
   logic read_ar_valid, read_ar_ready, read_r_ready;
-  logic [BurstLenWidth-1:0] read_beats_left;
+  logic [LenAxiWidth-1:0] read_beats_left;
   logic read_ar_full;
   // assertion only
   logic [AxiAddrWidth-1:0]  read_feed_next_addr_d, read_feed_next_addr_q;
@@ -80,14 +76,14 @@ module tcdm_to_axi
   // Write signals
   typedef struct packed {
     logic [AxiAddrWidth-1:0] addr;
-    logic [BurstLenWidth-1:0] len;
+    logic [LenAxiWidth-1:0] len;
   } write_aw_t;
   write_aw_t write_aw_fifo_data;
   logic write_aw_fifo_valid, write_aw_fifo_ready;
   logic write_aw_capture;
 
   logic write_w_valid, write_w_last, write_w_beat_accept;
-  logic [BurstLenWidth-1:0] write_beats_left;
+  logic [LenAxiWidth-1:0] write_beats_left;
 
   logic write_not_empty;
   logic write_full;
@@ -101,11 +97,11 @@ module tcdm_to_axi
   tcdm_burst_splitter #(
       .AddrWidth      (AxiAddrWidth),
       .BeatOffsetWidth(OffsetWidth),
-      .MaxBurstLen    (MaxBurstLen)
+      .MaxBurstBeats   (MaxBurstBeats)
   ) i_burst_splitter (
-      .addr_i            (tcdm_req_i.q.addr),
-      .contiguous_i,
-      .burst_len_o       (burst_len)
+      .addr_i     (tcdm_req_i.q.addr),
+      .len_beats_i(len_beats_i),
+      .len_axi_o(len_axi)
   );
 
   ////////////////////////////////////////////////////////////////////////////
@@ -129,14 +125,14 @@ module tcdm_to_axi
   always_comb begin : proc_read_ar
     read_ar_d       = '0;
     read_ar_d.addr  = tcdm_req_i.q.addr;
-    read_ar_d.len   = $bits(read_ar_d.len)'(burst_len);
+    read_ar_d.len   = $bits(read_ar_d.len)'(len_axi);
     read_ar_d.size  = $bits(read_ar_d.size)'(OffsetWidth);
     read_ar_d.burst = axi_pkg::BURST_INCR;
     read_ar         = read_ar_valid ? read_ar_d : read_ar_q;
   end
 
   cc_credit_counter #(
-      .NumCredits     (MaxOutstanding),
+      .NumCredits     (MaxReadOutstanding),
       .InitCreditEmpty(1'b1)
   ) i_read_credit_counter (
       .clk_i,
@@ -151,7 +147,7 @@ module tcdm_to_axi
   );
 
   cc_delta_counter #(
-      .Width(BurstLenWidth)
+      .Width(LenAxiWidth)
   ) i_read_beats_left (
       .clk_i,
       .rst_ni,
@@ -159,8 +155,8 @@ module tcdm_to_axi
       .en_i      (read_tcdm_beat_accept),
       .load_i    (read_ar_accept),
       .down_i    (1'b1),
-      .delta_i   (BurstLenWidth'(1)),
-      .d_i       (burst_len), // first beat is already accepted with AR
+      .delta_i   (LenAxiWidth'(1)),
+      .d_i       (len_axi), // first beat is already accepted with AR
       .q_o       (read_beats_left),
       .overflow_o(/* unused */)
   );
@@ -200,14 +196,15 @@ module tcdm_to_axi
   assign write_aw_capture = write_w_beat_accept && write_first_w;
   assign write_aw_valid   = write_aw_fifo_valid;
   assign write_last_beat  = write_burst_active ?
-                            (write_beats_left == BurstLenWidth'(1)) :
-                            (burst_len == '0);
+                            (write_beats_left == LenAxiWidth'(1)) :
+                            (len_axi == '0);
   assign write_w_last        = write_w_valid && write_last_beat;
   assign write_w_beat_accept = write_w_valid && axi_rsp_i.w_ready;
   assign write_busy          = write_w_valid || write_burst_active ||
                                write_not_empty;
   assign write_busy_o = write_busy;
 
+  // FallThrough to prevent 1 cycle delay
   cc_stream_fifo #(
       .FallThrough(1'b1),
       .Depth      (WriteAwFifoDepth),
@@ -218,7 +215,7 @@ module tcdm_to_axi
       .clr_i  (1'b0),
       .flush_i(1'b0),
       .usage_o(/* unused */),
-      .data_i ({tcdm_req_i.q.addr, burst_len}),
+      .data_i ({tcdm_req_i.q.addr, len_axi}),
       .valid_i(write_aw_capture),
       .ready_o(write_aw_fifo_ready),
       .data_o (write_aw_fifo_data),
@@ -242,7 +239,7 @@ module tcdm_to_axi
   );
 
   cc_delta_counter #(
-      .Width(BurstLenWidth)
+      .Width(LenAxiWidth)
   ) i_write_beats_left (
       .clk_i,
       .rst_ni,
@@ -250,8 +247,8 @@ module tcdm_to_axi
       .en_i      (write_w_beat_accept),
       .load_i    (write_aw_capture),
       .down_i    (1'b1),
-      .delta_i   (BurstLenWidth'(1)),
-      .d_i       (burst_len),
+      .delta_i   (LenAxiWidth'(1)),
+      .d_i       (len_axi),
       .q_o       (write_beats_left),
       .overflow_o(/* unused */)
   );
@@ -292,19 +289,15 @@ module tcdm_to_axi
 
   `ASSERT_INIT(AxiAddrCoversTcdm, (AxiAddrWidth >= TcdmAddrWidth))
   `ASSERT_INIT(AxiPageAddressWidth, (AxiAddrWidth >= 12)) // at least 4KB
-  `ASSERT_INIT(NonzeroOutstandingCapacity, (MaxOutstanding > 0))
+  `ASSERT_INIT(NonzeroOutstandingCapacity, (MaxReadOutstanding > 0))
   `ASSERT_INIT(NonzeroWriteCapacity, (MaxWriteOutstanding > 0))
-  `ASSERT_INIT(NonzeroMaxBurstLen, (MaxBurstLen > 0))
-  `ASSERT_INIT(MaxBurstFitsAxiLen, (MaxBurstLen <= 256))
+  `ASSERT_INIT(NonzeroMaxBurstBeats, (MaxBurstBeats > 0))
+  `ASSERT_INIT(MaxBurstFitsAxiLen, (MaxBurstBeats <= 256))
   `ASSERT(SpatzReadBurstAddress_A,
           read_burst_active && read_tcdm_accept |->
               (tcdm_req_i.q.addr == read_feed_next_addr_q))
   `ASSERT(SpatzReadResponseOkay_A,
           read_r_tcdm_accept |-> (axi_rsp_i.r.resp == axi_pkg::RESP_OKAY))
-  // input read burst addr needs to be aligned to AXI DataWidth
-  `ASSERT(SpatzReadBurstAligned_A,
-          read_ar_valid && (burst_len != '0) |->
-              (tcdm_req_i.q.addr[OffsetWidth-1:0] == '0))
   `ASSERT(SpatzReadBeatNoWriteBurst_A,
           read_burst_active |-> !write_busy)
   `ASSERT(SpatzWriteBeatNoRead_A,

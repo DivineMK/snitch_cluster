@@ -8,18 +8,18 @@
 module tcdm_burst_splitter
 #(
     parameter int unsigned AddrWidth   = 48,
-    parameter int unsigned MaxBurstLen = 8,
+    parameter int unsigned MaxBurstBeats = 8,
     parameter int unsigned BeatOffsetWidth = 6,  // 64B
     parameter int unsigned PageOffsetWidth = 12, // 4KB
-    parameter int unsigned LenBeatsWidth = 4,
     // Derived parameters. DO NOT CHANGE!
     localparam int unsigned BeatBytes   = 1 << BeatOffsetWidth,
     localparam int unsigned PageBytes   = 1 << PageOffsetWidth,
-    localparam int unsigned BurstLenWidth   = cc_pkg::cnt_width(MaxBurstLen)
+    localparam int unsigned LenBeatsWidth = cc_pkg::cnt_width(MaxBurstBeats),
+    localparam int unsigned LenAxiWidth  = cc_pkg::idx_width(MaxBurstBeats)
 ) (
     input  logic [AddrWidth-1:0]     addr_i,
     input  logic [LenBeatsWidth-1:0] len_beats_i,
-    output logic [BurstLenWidth-1:0] burst_len_o
+    output logic [LenAxiWidth-1:0]   len_axi_o
 );
 
   localparam int unsigned PaddedAddrWidth = AddrWidth+1;
@@ -30,15 +30,15 @@ module tcdm_burst_splitter
 
   always_comb begin : proc_clamp
     burst_beats = PaddedAddrWidth'(len_beats_i);
-    if (burst_beats > MaxBurstLen)
-      burst_beats = MaxBurstLen;
+    if (burst_beats > MaxBurstBeats)
+      burst_beats = MaxBurstBeats;
     if (burst_beats > page_beats)
       burst_beats = page_beats;
-    burst_len_o = BurstLenWidth'(burst_beats - 1'b1);
+    len_axi_o = LenAxiWidth'(burst_beats - 1'b1);
   end
 
   `ASSERT_INIT(NonzeroBeatBytes, BeatBytes > 0)
-  `ASSERT_INIT(NonzeroMaxBurstLen, MaxBurstLen > 0)
+  `ASSERT_INIT(NonzeroMaxBurstBeats, MaxBurstBeats > 0)
   `ASSERT_INIT(PageCoversBeat, PageOffsetWidth >= BeatOffsetWidth)
   `ASSERT_INIT(PageOffsetFitsAddr, PageOffsetWidth <= AddrWidth)
 endmodule

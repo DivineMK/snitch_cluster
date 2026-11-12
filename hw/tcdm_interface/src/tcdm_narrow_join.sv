@@ -108,8 +108,7 @@ module tcdm_narrow_join
   lane_mask_t rsp_mask_wdata, rsp_mask_rdata;
   logic rsp_mask_valid, rsp_mask_ready;
   assign rsp_mask_wdata = lane_sel;
-  // Write beats are acked by the converter at the request handshake, so they
-  // take no lane-mask entry; the FIFO only tracks read responses.
+
   logic write_beat;
   assign write_beat = join_write && write_busy_i;
   assign request_accept_o = join_oup_valid && wide_rsp_i.q_ready &&
